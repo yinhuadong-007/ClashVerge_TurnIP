@@ -13,10 +13,13 @@ $env:CLASH_SECRET = "your_api_secret"
 $env:CLASH_CONTROLLER = "127.0.0.1:9097"      # optional, default is 127.0.0.1:9097
 $env:CLASH_PROXY = "http://127.0.0.1:7897"    # optional, used for public IP checks
 $env:CLASH_GROUP = "GLOBAL"                   # optional, detects the public-IP route group when omitted
-$env:IP_HISTORY_LIMIT = "20"                  # optional, recent IP history size
+$env:IP_HISTORY_LIMIT = "50"                  # optional, recent IP history size
 $env:MAX_ACCEPTABLE_DELAY_MS = "300"          # optional, max acceptable node delay
 $env:ROTATE_INTERVAL_MS = "300000"            # optional, default 5 minutes
 $env:DISCOVER_SETTLE_MS = "1200"              # optional, wait before IP check after each switch
+$env:API_BIND = "127.0.0.1"                   # optional, API listen address
+$env:API_PORT = "8787"                        # optional, API port
+$env:API_TOKEN = "change_me"                  # optional, API auth token (no auth when empty)
 $env:DEBUG_LOGS = "1"                         # optional, enables detailed debug logs
 node .\scripts\rotate-ip.js
 ```
@@ -32,7 +35,18 @@ run-rotate-ip.cmd
 
 ## State File
 - Script stores recent state in `data/ip-state.json`.
-- `lastIps` keeps the latest `IP_HISTORY_LIMIT` accepted public IPs, defaulting to 20.
+- `lastIps` keeps the latest `IP_HISTORY_LIMIT` accepted public IPs, defaulting to 50.
+
+## API Endpoints
+- `GET /health`: returns current service status (no token required).
+- `POST /rotate`: triggers one immediate IP-rotation cycle.
+- When `API_TOKEN` is set, `POST /rotate` requires `Authorization: Bearer <token>` or `x-api-token: <token>`.
+
+PowerShell examples:
+```powershell
+Invoke-RestMethod -Method Get "http://127.0.0.1:8787/health"
+Invoke-RestMethod -Method Post "http://127.0.0.1:8787/rotate" -Headers @{ "Authorization" = "Bearer change_me" }
+```
 
 ## Notes
 - The script excludes `DIRECT` and `REJECT` from candidate nodes.

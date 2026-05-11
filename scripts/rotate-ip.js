@@ -2,13 +2,14 @@
 'use strict';
 
 const fs = require('fs/promises');
+const http = require('http');
 const net = require('net');
 const path = require('path');
 const tls = require('tls');
 
 const DEFAULT_CONTROLLER = '127.0.0.1:9097';
 const DEFAULT_GROUP_PRIORITY = ['GLOBAL', 'Proxy'];
-const IP_HISTORY_LIMIT = Number(process.env.IP_HISTORY_LIMIT || 20);
+const IP_HISTORY_LIMIT = Number(process.env.IP_HISTORY_LIMIT || 50);
 const MAX_ACCEPTABLE_DELAY_MS = Number(process.env.MAX_ACCEPTABLE_DELAY_MS || 300);
 const ROTATE_INTERVAL_MS = Number(process.env.ROTATE_INTERVAL_MS || 5 * 60 * 1000);
 const DISCOVER_SETTLE_MS = Number(process.env.DISCOVER_SETTLE_MS || 1200);
@@ -19,6 +20,9 @@ const CLASH_PROXY = process.env.CLASH_PROXY || 'http://127.0.0.1:7897';
 const DELAY_TEST_URL = process.env.DELAY_TEST_URL || 'https://www.gstatic.com/generate_204';
 const DELAY_TEST_TIMEOUT_MS = Number(process.env.DELAY_TEST_TIMEOUT_MS || 5000);
 const DEBUG_LOGS = process.env.DEBUG_LOGS === '1';
+const API_BIND = process.env.API_BIND || '127.0.0.1';
+const API_PORT = Number(process.env.API_PORT || 8787);
+const API_TOKEN = (process.env.API_TOKEN || '').trim();
 
 function ts() {
   return new Date().toISOString();
@@ -383,6 +387,21 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(payload));
+}
+
+function isApiAuthorized(req) {
+  if (!API_TOKEN) {
+    return true;
+  }
+  const auth = String(req.headers.authorization || '');
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const headerToken = String(req.headers['x-api-token'] || '').trim();
+  return bearer === API_TOKEN || headerToken === API_TOKEN;
+}
+
 async function discoverNodeIps({ baseUrl, secret, groupName, candidates, oldIp }) {
   const discovered = [];
   for (let idx = 0; idx < candidates.length; idx += 1) {
@@ -512,6 +531,9 @@ async function main() {
   if (!Number.isInteger(DELAY_TEST_TIMEOUT_MS) || DELAY_TEST_TIMEOUT_MS < 1000) {
     throw new Error(`DELAY_TEST_TIMEOUT_MS must be an integer >= 1000, got: ${process.env.DELAY_TEST_TIMEOUT_MS}`);
   }
+  if (!Number.isInteger(API_PORT) || API_PORT < 1 || API_PORT > 65535) {
+    throw new Error(`API_PORT must be an integer between 1 and 65535, got: ${process.env.API_PORT}`);
+  }
 
   const baseUrl = normalizeController(process.env.CLASH_CONTROLLER);
   const desiredGroup = process.env.CLASH_GROUP ? process.env.CLASH_GROUP.trim() : '';
@@ -522,6 +544,9 @@ async function main() {
   let loadingTimer = null;
   let cycleRunning = false;
   let cycleNo = 0;
+  let lastCycleAt = null;
+  let nextRunAt = null;
+  let apiServer = null;
 
   function stopCountdown() {
     if (countdownTimer) {
@@ -657,28 +682,36 @@ async function main() {
     }));
   }
 
-  async function runCycle() {
-    if (stopping || cycleRunning) {
-      return;
+  async function runCycle(source = 'timer') {
+    if (stopping) {
+      return { ok: false, error: 'service is stopping' };
+    }
+    if (cycleRunning) {
+      return { ok: false, error: 'rotation cycle already running', busy: true };
     }
     stopCountdown();
     cycleRunning = true;
     cycleNo += 1;
-    console.log(`${ts()} service=running cycle=${cycleNo} msg="rotation cycle started"`);
+    console.log(`${ts()} service=running cycle=${cycleNo} source=${source} msg="rotation cycle started"`);
     startLoading('获取可用IP中 ');
+    let cycleError = null;
     try {
       await rotateOnce();
     } catch (err) {
+      cycleError = err;
       console.error(`${ts()} service=running cycle=${cycleNo} result=error msg="${err.message}"`);
     } finally {
       stopLoading();
       cycleRunning = false;
+      lastCycleAt = ts();
       if (!stopping) {
         timer = setTimeout(runCycle, ROTATE_INTERVAL_MS);
+        nextRunAt = Date.now() + ROTATE_INTERVAL_MS;
         console.log(`${ts()} service=running cycle=${cycleNo} msg="next cycle scheduled in ${ROTATE_INTERVAL_MS}ms"`);
-        startCountdown(Date.now() + ROTATE_INTERVAL_MS);
+        startCountdown(nextRunAt);
       }
     }
+    return { ok: !cycleError, error: cycleError ? cycleError.message : null, cycle: cycleNo };
   }
 
   function shutdown(signal) {
@@ -692,6 +725,10 @@ async function main() {
     }
     stopCountdown();
     stopLoading();
+    if (apiServer) {
+      apiServer.close();
+      apiServer = null;
+    }
     console.log(`${ts()} service=stopping signal=${signal} msg="shutdown requested, no further cycles will be scheduled"`);
     if (!cycleRunning) {
       process.exit(0);
@@ -700,6 +737,48 @@ async function main() {
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  apiServer = http.createServer(async (req, res) => {
+    const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+
+    if (requestUrl.pathname === '/health' && req.method === 'GET') {
+      sendJson(res, 200, {
+        ok: true,
+        service: stopping ? 'stopping' : 'running',
+        cycleRunning,
+        cycleNo,
+        lastCycleAt,
+        nextRunAt
+      });
+      return;
+    }
+
+    if (requestUrl.pathname === '/rotate' && req.method === 'POST') {
+      if (!isApiAuthorized(req)) {
+        sendJson(res, 401, { ok: false, error: 'unauthorized' });
+        return;
+      }
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      const result = await runCycle('api');
+      if (!result.ok) {
+        sendJson(res, result.busy ? 409 : 503, result);
+        return;
+      }
+      sendJson(res, 200, result);
+      return;
+    }
+
+    sendJson(res, 404, { ok: false, error: 'not found' });
+  });
+
+  await new Promise((resolve, reject) => {
+    apiServer.once('error', reject);
+    apiServer.listen(API_PORT, API_BIND, resolve);
+  });
+  console.log(`${ts()} service=started msg="api server listening" bind=${API_BIND} port=${API_PORT}`);
 
   console.log(`${ts()} service=started msg="rotate-ip service started, press Ctrl+C to stop" intervalMs=${ROTATE_INTERVAL_MS}`);
   await runCycle();
