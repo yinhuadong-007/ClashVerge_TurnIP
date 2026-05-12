@@ -13,9 +13,9 @@ $env:CLASH_SECRET = "your_api_secret"
 $env:CLASH_CONTROLLER = "127.0.0.1:9097"      # optional, default is 127.0.0.1:9097
 $env:CLASH_PROXY = "http://127.0.0.1:7897"    # optional, used for public IP checks
 $env:CLASH_GROUP = "GLOBAL"                   # optional, detects the public-IP route group when omitted
-$env:IP_HISTORY_LIMIT = "50"                  # optional, recent IP history size
 $env:MAX_ACCEPTABLE_DELAY_MS = "300"          # optional, max acceptable node delay
 $env:ROTATE_INTERVAL_MS = "300000"            # optional, default 5 minutes
+$env:ROTATE_ON_START = "1"                    # optional, rotate once on startup (1/0)
 $env:DISCOVER_SETTLE_MS = "1200"              # optional, wait before IP check after each switch
 $env:API_BIND = "127.0.0.1"                   # optional, API listen address
 $env:API_PORT = "8787"                        # optional, API port
@@ -35,7 +35,7 @@ run-rotate-ip.cmd
 
 ## State File
 - Script stores recent state in `data/ip-state.json`.
-- `lastIps` keeps the latest `IP_HISTORY_LIMIT` accepted public IPs, defaulting to 50.
+- `lastIps` stores accepted public IP history.
 
 ## API Endpoints
 - `GET /health`: returns current service status (no token required).
@@ -53,10 +53,13 @@ Invoke-RestMethod -Method Post "http://127.0.0.1:8787/rotate" -Headers @{ "Autho
 - Public IP checks explicitly use `CLASH_PROXY`, defaulting to Clash Verge port `7897`.
 - When `CLASH_GROUP` is omitted, the script detects the policy group actually used by public IP checks.
 - Each cycle first discovers all candidate nodes' reachable public IPs.
-- It stops as soon as it finds a node whose IP is outside recent history and whose delay is <= `MAX_ACCEPTABLE_DELAY_MS`.
-- If every reachable IP is already in history, it falls back to the oldest historical IP that still exists and has delay <= `MAX_ACCEPTABLE_DELAY_MS`.
-- If no node matches either the new-IP rule or fallback rule, the current IP is left unchanged.
+- It stops as soon as it finds a node whose IP is outside history and whose delay is <= `MAX_ACCEPTABLE_DELAY_MS`.
+- It prefers non-HK IPs outside history; when unique reachable non-HK IPs are `>20`, HK IPs are not used.
+- When unique reachable non-HK IPs are `<=20`, HK fallback is allowed if no non-HK candidate is available.
+- When no acceptable candidate is found in a cycle (regardless of branch), it clears history and retries once in the same cycle.
+- If still no node matches constraints after retry, the current IP is left unchanged.
 - Each cycle is scheduled with `ROTATE_INTERVAL_MS` (default `300000`, i.e. 5 minutes).
+- `ROTATE_ON_START` controls whether one rotation runs immediately at startup (enabled by default; disabled by `0/false/no/off`).
 - Discovery waits `DISCOVER_SETTLE_MS` (default `1200` ms) before checking IP.
 - By default only startup, summary, success, and error logs are printed; set `DEBUG_LOGS=1` for detailed discovery logs.
 - Exit code is non-zero on startup failure.

@@ -9,9 +9,9 @@ const tls = require('tls');
 
 const DEFAULT_CONTROLLER = '127.0.0.1:9097';
 const DEFAULT_GROUP_PRIORITY = ['GLOBAL', 'Proxy'];
-const IP_HISTORY_LIMIT = Number(process.env.IP_HISTORY_LIMIT || 50);
 const MAX_ACCEPTABLE_DELAY_MS = Number(process.env.MAX_ACCEPTABLE_DELAY_MS || 300);
 const ROTATE_INTERVAL_MS = Number(process.env.ROTATE_INTERVAL_MS || 5 * 60 * 1000);
+const ROTATE_ON_START = !['0', 'false', 'no', 'off'].includes(String(process.env.ROTATE_ON_START || '1').toLowerCase());
 const DISCOVER_SETTLE_MS = Number(process.env.DISCOVER_SETTLE_MS || 1200);
 const STATE_PATH = path.resolve(__dirname, '..', 'data', 'ip-state.json');
 const PROXIES_RAW_PATH = path.resolve(__dirname, '..', 'data', 'proxies-raw.json');
@@ -23,6 +23,8 @@ const DEBUG_LOGS = process.env.DEBUG_LOGS === '1';
 const API_BIND = process.env.API_BIND || '127.0.0.1';
 const API_PORT = Number(process.env.API_PORT || 8787);
 const API_TOKEN = (process.env.API_TOKEN || '').trim();
+const NON_HK_DISABLE_HK_FALLBACK_THRESHOLD = 20;
+const ipCountryCache = new Map();
 
 function ts() {
   return new Date().toISOString();
@@ -252,10 +254,13 @@ async function readState() {
     if (!Array.isArray(parsed.lastIps)) {
       parsed.lastIps = [];
     }
+    if (!Number.isInteger(parsed.historyResetCount) || parsed.historyResetCount < 0) {
+      parsed.historyResetCount = 0;
+    }
     return parsed;
   } catch (err) {
     if (err.code === 'ENOENT') {
-      return { lastIps: [], lastNode: null, updatedAt: null };
+      return { lastIps: [], lastNode: null, updatedAt: null, historyResetCount: 0 };
     }
     throw err;
   }
@@ -379,6 +384,46 @@ async function getPublicIp() {
   throw new Error(`Failed to query public IP from all endpoints: ${lastError ? lastError.message : 'unknown error'}`);
 }
 
+async function getCountryCodeByIp(ip) {
+  if (ipCountryCache.has(ip)) {
+    return ipCountryCache.get(ip);
+  }
+
+  const endpoints = [
+    `https://ipapi.co/${ip}/country/`,
+    `https://ipwho.is/${ip}`
+  ];
+  let lastError = null;
+  for (const url of endpoints) {
+    try {
+      const txt = (await fetchTextViaHttpProxy(url, CLASH_PROXY, 9000)).trim();
+      if (!txt) {
+        throw new Error('empty geoip response');
+      }
+      let countryCode = null;
+      if (url.includes('ipapi.co')) {
+        countryCode = txt.toUpperCase();
+      } else {
+        const parsed = JSON.parse(txt);
+        countryCode = String(parsed.country_code || '').toUpperCase();
+      }
+      if (!countryCode) {
+        throw new Error('missing country code');
+      }
+      ipCountryCache.set(ip, countryCode);
+      return countryCode;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw new Error(`failed to resolve country code for ip=${ip}: ${lastError ? lastError.message : 'unknown error'}`);
+}
+
+async function isHongKongIp(ip) {
+  const countryCode = await getCountryCodeByIp(ip);
+  return countryCode === 'HK';
+}
+
 function formatLog({ group, attempt, node, oldIp, newIp, result, message }) {
   return `${ts()} group=${group} attempt=${attempt} node="${node}" oldIP=${oldIp || '-'} newIP=${newIp || '-'} result=${result} msg="${message}"`;
 }
@@ -436,7 +481,9 @@ async function discoverNodeIps({ baseUrl, secret, groupName, candidates, oldIp }
 }
 
 async function findAndAcceptNode({ baseUrl, secret, groupName, candidates, proxies, previousIps, oldIp }) {
-  const fallbackByIp = new Map();
+  const nonHkUniqueIps = new Set();
+  let firstNonHkCandidate = null;
+  let firstHkCandidate = null;
 
   for (let idx = 0; idx < candidates.length; idx += 1) {
     const node = candidates[idx];
@@ -458,14 +505,21 @@ async function findAndAcceptNode({ baseUrl, secret, groupName, candidates, proxi
       await clashPut(baseUrl, secret, `/proxies/${encodeURIComponent(groupName)}`, { name: node });
       await sleep(DISCOVER_SETTLE_MS);
       const ip = await getPublicIp();
-
-      if (!fallbackByIp.has(ip)) {
-        fallbackByIp.set(ip, {
+      const isHk = await isHongKongIp(ip).catch((err) => {
+        debugLog(formatLog({
+          group: groupName,
           attempt: idx + 1,
           node,
-          ip,
-          delay
-        });
+          oldIp,
+          newIp: ip,
+          result: 'discover-warn',
+          message: `geoip-check-failed, treated-as-non-hk: ${err.message}`
+        }));
+        return false;
+      });
+
+      if (!isHk) {
+        nonHkUniqueIps.add(ip);
       }
 
       if (previousIps.includes(ip)) {
@@ -481,12 +535,35 @@ async function findAndAcceptNode({ baseUrl, secret, groupName, candidates, proxi
         continue;
       }
 
-      return {
+      const candidate = {
         attempt: idx + 1,
         node,
         ip,
         delay
       };
+
+      if (isHk) {
+        debugLog(formatLog({
+          group: groupName,
+          attempt: idx + 1,
+          node,
+          oldIp,
+          newIp: ip,
+          result: 'discover-skip',
+          message: 'hong-kong-ip-deferred'
+        }));
+        if (!firstHkCandidate) {
+          firstHkCandidate = candidate;
+        }
+      } else if (!firstNonHkCandidate) {
+        firstNonHkCandidate = candidate;
+        return {
+          accepted: firstNonHkCandidate,
+          nonHkUniqueCount: nonHkUniqueIps.size,
+          hkFallbackAllowed: false,
+          historyResetTriggered: false
+        };
+      }
     } catch (err) {
       debugLog(formatLog({
         group: groupName,
@@ -500,24 +577,39 @@ async function findAndAcceptNode({ baseUrl, secret, groupName, candidates, proxi
     }
   }
 
-  for (const historicalIp of previousIps) {
-    if (fallbackByIp.has(historicalIp)) {
-      const fallback = fallbackByIp.get(historicalIp);
-      fallback.fallback = true;
-      return fallback;
-    }
+  const nonHkUniqueCount = nonHkUniqueIps.size;
+  const hkFallbackAllowed = nonHkUniqueCount <= NON_HK_DISABLE_HK_FALLBACK_THRESHOLD;
+
+  if (firstNonHkCandidate) {
+    return {
+      accepted: firstNonHkCandidate,
+      nonHkUniqueCount,
+      hkFallbackAllowed,
+      historyResetTriggered: false
+    };
   }
 
-  return null;
+  if (hkFallbackAllowed && firstHkCandidate) {
+    return {
+      accepted: { ...firstHkCandidate, hkFallback: true },
+      nonHkUniqueCount,
+      hkFallbackAllowed,
+      historyResetTriggered: false
+    };
+  }
+
+  return {
+    accepted: null,
+    nonHkUniqueCount,
+    hkFallbackAllowed,
+    historyResetTriggered: nonHkUniqueCount > NON_HK_DISABLE_HK_FALLBACK_THRESHOLD
+  };
 }
 
 async function main() {
   const secret = process.env.CLASH_SECRET;
   if (!secret || !secret.trim()) {
     throw new Error('Missing required environment variable: CLASH_SECRET');
-  }
-  if (!Number.isInteger(IP_HISTORY_LIMIT) || IP_HISTORY_LIMIT < 1) {
-    throw new Error(`IP_HISTORY_LIMIT must be a positive integer, got: ${process.env.IP_HISTORY_LIMIT}`);
   }
   if (!Number.isInteger(MAX_ACCEPTABLE_DELAY_MS) || MAX_ACCEPTABLE_DELAY_MS < 1) {
     throw new Error(`MAX_ACCEPTABLE_DELAY_MS must be a positive integer, got: ${process.env.MAX_ACCEPTABLE_DELAY_MS}`);
@@ -594,7 +686,8 @@ async function main() {
 
   async function rotateOnce() {
     const state = await readState();
-    const previousIps = Array.isArray(state.lastIps) ? state.lastIps.slice(-IP_HISTORY_LIMIT) : [];
+    const previousIps = Array.isArray(state.lastIps) ? [...state.lastIps] : [];
+    let historyResetCount = state.historyResetCount || 0;
 
     const beforeIp = await getPublicIp().catch(() => null);
     let proxiesResp = await clashGet(baseUrl, secret, '/proxies');
@@ -645,7 +738,7 @@ async function main() {
       pool = candidates;
     }
     const orderedCandidates = shuffled(pool);
-    const accepted = await findAndAcceptNode({
+    let decision = await findAndAcceptNode({
       baseUrl,
       secret,
       groupName,
@@ -654,21 +747,46 @@ async function main() {
       previousIps,
       oldIp: beforeIp
     });
+    let accepted = decision.accepted;
 
     if (!accepted) {
-      console.log(`${ts()} group=${groupName} result=unchanged oldIP=${beforeIp || '-'} msg="no node matched IP history and delay constraints"`);
+      historyResetCount += 1;
+      await writeState({
+        lastIps: [],
+        lastNode: state.lastNode || null,
+        updatedAt: ts(),
+        group: groupName,
+        historyResetCount
+      });
+      console.log(`${ts()} group=${groupName} result=history-reset oldIP=${beforeIp || '-'} nonHkUniqueCount=${decision.nonHkUniqueCount} hkFallbackAllowed=${decision.hkFallbackAllowed} msg="no acceptable candidate found, history cleared and retrying"`);
+      decision = await findAndAcceptNode({
+        baseUrl,
+        secret,
+        groupName,
+        candidates: orderedCandidates,
+        proxies,
+        previousIps: [],
+        oldIp: beforeIp
+      });
+      accepted = decision.accepted;
+    }
+
+    if (!accepted) {
+      console.log(`${ts()} group=${groupName} result=unchanged oldIP=${beforeIp || '-'} nonHkUniqueCount=${decision.nonHkUniqueCount} hkFallbackAllowed=${decision.hkFallbackAllowed} msg="no node matched constraints after history reset retry"`);
       return;
     }
 
     await clashPut(baseUrl, secret, `/proxies/${encodeURIComponent(groupName)}`, { name: accepted.node });
     await sleep(DISCOVER_SETTLE_MS);
 
-    const newLastIps = [...previousIps, accepted.ip].slice(-IP_HISTORY_LIMIT);
+    const historyBase = previousIps.includes(accepted.ip) ? [] : previousIps;
+    const newLastIps = [...historyBase, accepted.ip];
     await writeState({
       lastIps: newLastIps,
       lastNode: accepted.node,
       updatedAt: ts(),
-      group: groupName
+      group: groupName,
+      historyResetCount
     });
 
     console.log(formatLog({
@@ -678,7 +796,7 @@ async function main() {
       oldIp: beforeIp,
       newIp: accepted.ip,
       result: 'success',
-      message: `ip switched and accepted, delay=${accepted.delay}ms${accepted.fallback ? ', fallback=oldest-history' : ''}`
+      message: `ip switched and accepted, delay=${accepted.delay}ms${accepted.hkFallback ? ', fallback=hong-kong-only' : ''}`
     }));
   }
 
@@ -781,7 +899,14 @@ async function main() {
   console.log(`${ts()} service=started msg="api server listening" bind=${API_BIND} port=${API_PORT}`);
 
   console.log(`${ts()} service=started msg="rotate-ip service started, press Ctrl+C to stop" intervalMs=${ROTATE_INTERVAL_MS}`);
-  await runCycle();
+  if (ROTATE_ON_START) {
+    await runCycle('startup');
+  } else {
+    timer = setTimeout(runCycle, ROTATE_INTERVAL_MS);
+    nextRunAt = Date.now() + ROTATE_INTERVAL_MS;
+    console.log(`${ts()} service=running cycle=0 msg="startup rotation skipped, first cycle scheduled in ${ROTATE_INTERVAL_MS}ms"`);
+    startCountdown(nextRunAt);
+  }
 }
 
 main().catch((err) => {
