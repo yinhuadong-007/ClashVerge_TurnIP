@@ -639,12 +639,14 @@ async function main() {
   let lastCycleAt = null;
   let nextRunAt = null;
   let apiServer = null;
+  let countdownLastLen = 0;
 
   function stopCountdown() {
     if (countdownTimer) {
       clearInterval(countdownTimer);
       countdownTimer = null;
       clearCountdownLine();
+      countdownLastLen = 0;
     }
   }
 
@@ -655,7 +657,10 @@ async function main() {
     stopCountdown();
     const render = () => {
       const remaining = nextRunAt - Date.now();
-      process.stdout.write(`\r距离下次更新 IP 还剩 ${formatDuration(remaining)}`);
+      const text = `距离下次更新 IP 还剩 ${formatDuration(remaining)}`;
+      const pad = countdownLastLen > text.length ? ' '.repeat(countdownLastLen - text.length) : '';
+      process.stdout.write(`\r${text}${pad}`);
+      countdownLastLen = text.length;
     };
     render();
     countdownTimer = setInterval(render, 1000);
