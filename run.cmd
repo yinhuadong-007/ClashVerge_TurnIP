@@ -16,10 +16,10 @@ REM set CLASH_GROUP=GLOBAL
 REM Optional: default is 300ms max acceptable node delay
 REM set MAX_ACCEPTABLE_DELAY_MS=300
 
-REM Optional: default is 300000ms (5 min)
-set ROTATE_INTERVAL_MS=900000
+REM Optional: default is 36000000ms (1 hours)
+set ROTATE_INTERVAL_MS=3600000
 REM Optional: rotate once immediately on startup (1/0, true/false)
-set ROTATE_ON_START=0
+set ROTATE_ON_START=1
 
 REM Optional: API server bind/port and token (token empty means no auth)
 REM set API_BIND=127.0.0.1

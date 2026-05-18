@@ -11,6 +11,7 @@ const DEFAULT_CONTROLLER = '127.0.0.1:9097';
 const DEFAULT_GROUP_PRIORITY = ['GLOBAL', 'Proxy'];
 const MAX_ACCEPTABLE_DELAY_MS = Number(process.env.MAX_ACCEPTABLE_DELAY_MS || 300);
 const ROTATE_INTERVAL_MS = Number(process.env.ROTATE_INTERVAL_MS || 5 * 60 * 1000);
+const AVAILABLE_IP_TIMEOUT_MS = Number(process.env.AVAILABLE_IP_TIMEOUT_MS || 5 * 60 * 1000);
 const ROTATE_ON_START = !['0', 'false', 'no', 'off'].includes(String(process.env.ROTATE_ON_START || '1').toLowerCase());
 const DISCOVER_SETTLE_MS = Number(process.env.DISCOVER_SETTLE_MS || 1200);
 const STATE_PATH = path.resolve(__dirname, '..', 'data', 'ip-state.json');
@@ -27,7 +28,16 @@ const NON_HK_DISABLE_HK_FALLBACK_THRESHOLD = 20;
 const ipCountryCache = new Map();
 
 function ts() {
-  return new Date().toISOString();
+  const date = new Date();
+  const pad = (value, len = 2) => String(value).padStart(len, '0');
+  const offsetMinutes = -date.getTimezoneOffset();
+  const offsetSign = offsetMinutes >= 0 ? '+' : '-';
+  const offsetAbs = Math.abs(offsetMinutes);
+  const offsetHours = Math.floor(offsetAbs / 60);
+  const offsetMins = offsetAbs % 60;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}` +
+    `${offsetSign}${pad(offsetHours)}:${pad(offsetMins)}`;
 }
 
 function debugLog(message) {
@@ -42,6 +52,24 @@ function formatDuration(ms) {
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
   return `${hours} h ${minutes} m ${seconds} s`;
+}
+
+function createDeadline(timeoutMs, label) {
+  const expiresAt = Date.now() + timeoutMs;
+  return {
+    remainingMs() {
+      return expiresAt - Date.now();
+    },
+    throwIfExpired() {
+      if (Date.now() >= expiresAt) {
+        throw new Error(`${label} timed out after ${timeoutMs}ms`);
+      }
+    },
+    timeoutFor(defaultMs) {
+      this.throwIfExpired();
+      return Math.max(1, Math.min(defaultMs, this.remainingMs()));
+    }
+  };
 }
 
 function clearCountdownLine() {
@@ -224,23 +252,23 @@ async function holdHttpsConnectViaProxy(targetUrl, proxyUrl, timeoutMs = 5000) {
   });
 }
 
-async function clashGet(baseUrl, secret, endpoint) {
+async function clashGet(baseUrl, secret, endpoint, timeoutMs = FETCH_TIMEOUT_MS) {
   const res = await fetchWithTimeout(`${baseUrl}${endpoint}`, {
     method: 'GET',
     headers: authHeaders(secret)
-  });
+  }, timeoutMs);
   if (!res.ok) {
     throw new Error(`GET ${endpoint} failed: ${res.status} ${res.statusText}`);
   }
   return res.json();
 }
 
-async function clashPut(baseUrl, secret, endpoint, body) {
+async function clashPut(baseUrl, secret, endpoint, body, timeoutMs = FETCH_TIMEOUT_MS) {
   const res = await fetchWithTimeout(`${baseUrl}${endpoint}`, {
     method: 'PUT',
     headers: authHeaders(secret),
     body: JSON.stringify(body)
-  });
+  }, timeoutMs);
   if (!res.ok) {
     throw new Error(`PUT ${endpoint} failed: ${res.status} ${res.statusText}`);
   }
@@ -295,11 +323,23 @@ function pickGroupName(proxies, preferredGroup) {
   );
 }
 
-async function detectPublicIpRouteGroup(baseUrl, secret, proxies) {
-  const socket = await holdHttpsConnectViaProxy('https://api.ipify.org', CLASH_PROXY);
+async function detectPublicIpRouteGroup(baseUrl, secret, proxies, deadline = null) {
+  const socket = await holdHttpsConnectViaProxy(
+    'https://api.ipify.org',
+    CLASH_PROXY,
+    deadline ? deadline.timeoutFor(5000) : 5000
+  );
   try {
     await sleep(1500);
-    const connectionsResp = await clashGet(baseUrl, secret, '/connections');
+    if (deadline) {
+      deadline.throwIfExpired();
+    }
+    const connectionsResp = await clashGet(
+      baseUrl,
+      secret,
+      '/connections',
+      deadline ? deadline.timeoutFor(FETCH_TIMEOUT_MS) : FETCH_TIMEOUT_MS
+    );
     const match = (connectionsResp.connections || []).find((conn) => conn.metadata && conn.metadata.host === 'api.ipify.org');
     if (!match || !Array.isArray(match.chains)) {
       debugLog(`${ts()} result=route-detect-miss host=api.ipify.org msg="no active connection found"`);
@@ -362,7 +402,7 @@ function shuffled(arr) {
   return a;
 }
 
-async function getPublicIp() {
+async function getPublicIp(deadline = null) {
   const endpoints = [
     'https://api.ipify.org',
     'https://ifconfig.me/ip',
@@ -371,7 +411,8 @@ async function getPublicIp() {
   let lastError = null;
   for (const url of endpoints) {
     try {
-      const txt = (await fetchTextViaHttpProxy(url, CLASH_PROXY, 9000)).trim();
+      const timeoutMs = deadline ? deadline.timeoutFor(9000) : 9000;
+      const txt = (await fetchTextViaHttpProxy(url, CLASH_PROXY, timeoutMs)).trim();
       if (txt) {
         debugLog(`${ts()} public-ip=${txt} source=${url} viaProxy=${CLASH_PROXY}`);
         return txt;
@@ -384,7 +425,7 @@ async function getPublicIp() {
   throw new Error(`Failed to query public IP from all endpoints: ${lastError ? lastError.message : 'unknown error'}`);
 }
 
-async function getCountryCodeByIp(ip) {
+async function getCountryCodeByIp(ip, deadline = null) {
   if (ipCountryCache.has(ip)) {
     return ipCountryCache.get(ip);
   }
@@ -396,7 +437,8 @@ async function getCountryCodeByIp(ip) {
   let lastError = null;
   for (const url of endpoints) {
     try {
-      const txt = (await fetchTextViaHttpProxy(url, CLASH_PROXY, 9000)).trim();
+      const timeoutMs = deadline ? deadline.timeoutFor(9000) : 9000;
+      const txt = (await fetchTextViaHttpProxy(url, CLASH_PROXY, timeoutMs)).trim();
       if (!txt) {
         throw new Error('empty geoip response');
       }
@@ -419,8 +461,8 @@ async function getCountryCodeByIp(ip) {
   throw new Error(`failed to resolve country code for ip=${ip}: ${lastError ? lastError.message : 'unknown error'}`);
 }
 
-async function isHongKongIp(ip) {
-  const countryCode = await getCountryCodeByIp(ip);
+async function isHongKongIp(ip, deadline = null) {
+  const countryCode = await getCountryCodeByIp(ip, deadline);
   return countryCode === 'HK';
 }
 
@@ -447,14 +489,23 @@ function isApiAuthorized(req) {
   return bearer === API_TOKEN || headerToken === API_TOKEN;
 }
 
-async function discoverNodeIps({ baseUrl, secret, groupName, candidates, oldIp }) {
+async function discoverNodeIps({ baseUrl, secret, groupName, candidates, oldIp, deadline = null }) {
   const discovered = [];
   for (let idx = 0; idx < candidates.length; idx += 1) {
+    if (deadline) {
+      deadline.throwIfExpired();
+    }
     const node = candidates[idx];
     try {
-      await clashPut(baseUrl, secret, `/proxies/${encodeURIComponent(groupName)}`, { name: node });
+      await clashPut(
+        baseUrl,
+        secret,
+        `/proxies/${encodeURIComponent(groupName)}`,
+        { name: node },
+        deadline ? deadline.timeoutFor(FETCH_TIMEOUT_MS) : FETCH_TIMEOUT_MS
+      );
       await sleep(DISCOVER_SETTLE_MS);
-      const ip = await getPublicIp();
+      const ip = await getPublicIp(deadline);
       discovered.push({ node, ip });
       debugLog(formatLog({
         group: groupName,
@@ -480,12 +531,15 @@ async function discoverNodeIps({ baseUrl, secret, groupName, candidates, oldIp }
   return discovered;
 }
 
-async function findAndAcceptNode({ baseUrl, secret, groupName, candidates, proxies, previousIps, oldIp }) {
+async function findAndAcceptNode({ baseUrl, secret, groupName, candidates, proxies, previousIps, oldIp, disallowIp = null, deadline = null }) {
   const nonHkUniqueIps = new Set();
   let firstNonHkCandidate = null;
   let firstHkCandidate = null;
 
   for (let idx = 0; idx < candidates.length; idx += 1) {
+    if (deadline) {
+      deadline.throwIfExpired();
+    }
     const node = candidates[idx];
     const delay = getLatestDelay(proxies[node]);
     if (delay === null || delay > MAX_ACCEPTABLE_DELAY_MS) {
@@ -502,10 +556,16 @@ async function findAndAcceptNode({ baseUrl, secret, groupName, candidates, proxi
     }
 
     try {
-      await clashPut(baseUrl, secret, `/proxies/${encodeURIComponent(groupName)}`, { name: node });
+      await clashPut(
+        baseUrl,
+        secret,
+        `/proxies/${encodeURIComponent(groupName)}`,
+        { name: node },
+        deadline ? deadline.timeoutFor(FETCH_TIMEOUT_MS) : FETCH_TIMEOUT_MS
+      );
       await sleep(DISCOVER_SETTLE_MS);
-      const ip = await getPublicIp();
-      const isHk = await isHongKongIp(ip).catch((err) => {
+      const ip = await getPublicIp(deadline);
+      const isHk = await isHongKongIp(ip, deadline).catch((err) => {
         debugLog(formatLog({
           group: groupName,
           attempt: idx + 1,
@@ -531,6 +591,18 @@ async function findAndAcceptNode({ baseUrl, secret, groupName, candidates, proxi
           newIp: ip,
           result: 'discover-skip',
           message: 'ip matched recent history'
+        }));
+        continue;
+      }
+      if (disallowIp && ip === disallowIp) {
+        debugLog(formatLog({
+          group: groupName,
+          attempt: idx + 1,
+          node,
+          oldIp,
+          newIp: ip,
+          result: 'discover-skip',
+          message: `ip matched disallowed target: ${disallowIp}`
         }));
         continue;
       }
@@ -617,6 +689,9 @@ async function main() {
   if (!Number.isInteger(ROTATE_INTERVAL_MS) || ROTATE_INTERVAL_MS < 1000) {
     throw new Error(`ROTATE_INTERVAL_MS must be an integer >= 1000, got: ${process.env.ROTATE_INTERVAL_MS}`);
   }
+  if (!Number.isInteger(AVAILABLE_IP_TIMEOUT_MS) || AVAILABLE_IP_TIMEOUT_MS < 1000) {
+    throw new Error(`AVAILABLE_IP_TIMEOUT_MS must be an integer >= 1000, got: ${process.env.AVAILABLE_IP_TIMEOUT_MS}`);
+  }
   if (!Number.isInteger(DISCOVER_SETTLE_MS) || DISCOVER_SETTLE_MS < 500) {
     throw new Error(`DISCOVER_SETTLE_MS must be an integer >= 500, got: ${process.env.DISCOVER_SETTLE_MS}`);
   }
@@ -689,35 +764,50 @@ async function main() {
     loadingTimer = setInterval(render, 150);
   }
 
-  async function rotateOnce() {
+  async function rotateOnce(deadline) {
     const state = await readState();
     const previousIps = Array.isArray(state.lastIps) ? [...state.lastIps] : [];
     let historyResetCount = state.historyResetCount || 0;
 
-    const beforeIp = await getPublicIp().catch(() => null);
-    let proxiesResp = await clashGet(baseUrl, secret, '/proxies');
+    deadline.throwIfExpired();
+    const beforeIp = await getPublicIp(deadline).catch(() => null);
+    deadline.throwIfExpired();
+    let proxiesResp = await clashGet(
+      baseUrl,
+      secret,
+      '/proxies',
+      deadline.timeoutFor(FETCH_TIMEOUT_MS)
+    );
     let proxies = proxiesResp.proxies || {};
-    const detectedGroup = desiredGroup ? null : await detectPublicIpRouteGroup(baseUrl, secret, proxies).catch((err) => {
+    const detectedGroup = desiredGroup ? null : await detectPublicIpRouteGroup(baseUrl, secret, proxies, deadline).catch((err) => {
       debugLog(`${ts()} result=route-detect-warn msg="${err.message}"`);
       return null;
     });
     const groupName = pickGroupName(proxies, desiredGroup || detectedGroup);
     let groupObj = proxies[groupName];
 
+    deadline.throwIfExpired();
     const encodedGroup = encodeURIComponent(groupName);
     const encodedUrl = encodeURIComponent(DELAY_TEST_URL);
     try {
       await clashGet(
         baseUrl,
         secret,
-        `/group/${encodedGroup}/delay?url=${encodedUrl}&timeout=${DELAY_TEST_TIMEOUT_MS}`
+        `/group/${encodedGroup}/delay?url=${encodedUrl}&timeout=${DELAY_TEST_TIMEOUT_MS}`,
+        deadline.timeoutFor(FETCH_TIMEOUT_MS)
       );
       debugLog(`${ts()} group=${groupName} result=delay-test msg="group delay test triggered"`);
     } catch (err) {
       debugLog(`${ts()} group=${groupName} result=delay-test-warn msg="${err.message}"`);
     }
 
-    proxiesResp = await clashGet(baseUrl, secret, '/proxies');
+    deadline.throwIfExpired();
+    proxiesResp = await clashGet(
+      baseUrl,
+      secret,
+      '/proxies',
+      deadline.timeoutFor(FETCH_TIMEOUT_MS)
+    );
     proxies = proxiesResp.proxies || {};
     groupObj = proxies[groupName];
     await writeProxiesRaw({
@@ -750,7 +840,9 @@ async function main() {
       candidates: orderedCandidates,
       proxies,
       previousIps,
-      oldIp: beforeIp
+      oldIp: beforeIp,
+      disallowIp: beforeIp,
+      deadline
     });
     let accepted = decision.accepted;
 
@@ -771,7 +863,9 @@ async function main() {
         candidates: orderedCandidates,
         proxies,
         previousIps: [],
-        oldIp: beforeIp
+        oldIp: beforeIp,
+        disallowIp: beforeIp,
+        deadline
       });
       accepted = decision.accepted;
     }
@@ -781,14 +875,57 @@ async function main() {
       return;
     }
 
-    await clashPut(baseUrl, secret, `/proxies/${encodeURIComponent(groupName)}`, { name: accepted.node });
-    await sleep(DISCOVER_SETTLE_MS);
+    const triedNodes = new Set();
+    let effectiveIp = null;
+    let finalAccepted = accepted;
+    let switchAttempts = 0;
+    while (finalAccepted && switchAttempts < Math.max(1, orderedCandidates.length)) {
+      deadline.throwIfExpired();
+      switchAttempts += 1;
+      triedNodes.add(finalAccepted.node);
+      await clashPut(
+        baseUrl,
+        secret,
+        `/proxies/${encodeURIComponent(groupName)}`,
+        { name: finalAccepted.node },
+        deadline.timeoutFor(FETCH_TIMEOUT_MS)
+      );
+      await sleep(DISCOVER_SETTLE_MS);
+      const finalIp = await getPublicIp(deadline).catch(() => finalAccepted.ip);
+      effectiveIp = finalIp || finalAccepted.ip;
+      if (!beforeIp || effectiveIp !== beforeIp) {
+        break;
+      }
+      console.log(`${ts()} group=${groupName} result=retry oldIP=${beforeIp} newIP=${effectiveIp} msg="switched IP equals previous IP, retrying another node"`);
+      const retryCandidates = orderedCandidates.filter((node) => !triedNodes.has(node));
+      if (retryCandidates.length === 0) {
+        finalAccepted = null;
+        break;
+      }
+      const retryDecision = await findAndAcceptNode({
+        baseUrl,
+        secret,
+        groupName,
+        candidates: retryCandidates,
+        proxies,
+        previousIps: [],
+        oldIp: beforeIp,
+        disallowIp: beforeIp,
+        deadline
+      });
+      finalAccepted = retryDecision.accepted;
+    }
 
-    const historyBase = previousIps.includes(accepted.ip) ? [] : previousIps;
-    const newLastIps = [...historyBase, accepted.ip];
+    if (!finalAccepted || !effectiveIp || (beforeIp && effectiveIp === beforeIp)) {
+      console.log(`${ts()} group=${groupName} result=unchanged oldIP=${beforeIp || '-'} msg="failed to switch to a different IP after retries"`);
+      return;
+    }
+
+    const historyBase = previousIps.includes(effectiveIp) ? [] : previousIps;
+    const newLastIps = [...historyBase, effectiveIp];
     await writeState({
       lastIps: newLastIps,
-      lastNode: accepted.node,
+      lastNode: finalAccepted.node,
       updatedAt: ts(),
       group: groupName,
       historyResetCount
@@ -796,12 +933,12 @@ async function main() {
 
     console.log(formatLog({
       group: groupName,
-      attempt: accepted.attempt,
-      node: accepted.node,
+      attempt: finalAccepted.attempt,
+      node: finalAccepted.node,
       oldIp: beforeIp,
-      newIp: accepted.ip,
+      newIp: effectiveIp,
       result: 'success',
-      message: `ip switched and accepted, delay=${accepted.delay}ms${accepted.hkFallback ? ', fallback=hong-kong-only' : ''}`
+      message: `ip switched and accepted, delay=${finalAccepted.delay}ms${finalAccepted.hkFallback ? ', fallback=hong-kong-only' : ''}${effectiveIp !== finalAccepted.ip ? `, verify-mismatch probed=${finalAccepted.ip}` : ''}`
     }));
   }
 
@@ -819,7 +956,7 @@ async function main() {
     startLoading('获取可用IP中 ');
     let cycleError = null;
     try {
-      await rotateOnce();
+      await rotateOnce(createDeadline(AVAILABLE_IP_TIMEOUT_MS, 'available IP discovery'));
     } catch (err) {
       cycleError = err;
       console.error(`${ts()} service=running cycle=${cycleNo} result=error msg="${err.message}"`);
